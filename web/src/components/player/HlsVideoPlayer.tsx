@@ -30,6 +30,12 @@ const unsupportedErrorCodes = [
   MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED,
   MediaError.MEDIA_ERR_DECODE,
 ];
+// a damaged frame fails to decode on every attempt, so playback resumes
+// this far past it; the decoder restarts from the next keyframe after that
+const DECODE_ERROR_SKIP_SECONDS = 1;
+// decode errors this close together count as one damaged stretch
+const DECODE_ERROR_WINDOW_SECONDS = 3;
+const MAX_DECODE_ERROR_RECOVERIES = 3;
 
 export interface HlsSource {
   playlist: string;
@@ -104,6 +110,36 @@ export default function HlsVideoPlayer({
   const [useHlsCompat, setUseHlsCompat] = useState(false);
   const [loadedMetadata, setLoadedMetadata] = useState(false);
   const [bufferTimeout, setBufferTimeout] = useState<NodeJS.Timeout>();
+  const decodeRecoveryRef = useRef({ count: 0, time: 0, reloading: false });
+
+  const recoverFromDecodeError = useCallback(() => {
+    const video = videoRef.current;
+
+    if (!video || !hlsRef.current) {
+      return false;
+    }
+
+    const errorTime = video.currentTime;
+    const recovery = decodeRecoveryRef.current;
+
+    if (
+      errorTime < recovery.time ||
+      errorTime - recovery.time > DECODE_ERROR_WINDOW_SECONDS
+    ) {
+      recovery.count = 0;
+    }
+
+    if (recovery.count >= MAX_DECODE_ERROR_RECOVERIES) {
+      return false;
+    }
+
+    recovery.count += 1;
+    recovery.time = errorTime;
+    recovery.reloading = true;
+    hlsRef.current.recoverMediaError();
+    video.currentTime = errorTime + DECODE_ERROR_SKIP_SECONDS;
+    return true;
+  }, [videoRef]);
 
   const applyVideoDimensions = useCallback(
     (width: number, height: number) => {
@@ -170,6 +206,7 @@ export default function HlsVideoPlayer({
     }
 
     setLoadedMetadata(false);
+    decodeRecoveryRef.current = { count: 0, time: 0, reloading: false };
 
     const currentPlaybackRate = videoRef.current.playbackRate;
 
@@ -538,7 +575,13 @@ export default function HlsVideoPlayer({
               }
             }}
             onLoadedData={() => {
-              onPlayerLoaded?.();
+              // recovering from a decode error reloads the media, which must
+              // not return playback to where the clip started
+              if (decodeRecoveryRef.current.reloading) {
+                decodeRecoveryRef.current.reloading = false;
+              } else {
+                onPlayerLoaded?.();
+              }
               handleLoadedMetadata();
 
               if (videoRef.current) {
@@ -565,7 +608,11 @@ export default function HlsVideoPlayer({
               ) {
                 setLoadedMetadata(false);
                 setUseHlsCompat(true);
-              } else {
+              } else if (
+                // @ts-expect-error code does exist
+                e.target.error.code != MediaError.MEDIA_ERR_DECODE ||
+                !recoverFromDecodeError()
+              ) {
                 toast.error(
                   // @ts-expect-error code does exist
                   `Failed to play recordings (error ${e.target.error.code}): ${e.target.error.message}`,
